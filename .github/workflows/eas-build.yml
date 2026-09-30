@@ -8,7 +8,7 @@ name: EAS Build
 
 run-name: >-
   ${{ inputs.platform }} ${{ inputs.profile }} build
-  [eas:dispatch_id=${{ inputs.dispatch_id }};platform=${{ inputs.platform }};profile=${{ inputs.profile }}]
+  [eas:dispatch_id=${{ inputs.dispatch_id }};platform=${{ inputs.platform }};profile=${{ inputs.profile }};distribution=${{ fromJSON(inputs.config_json).distribution }};simulator=${{ fromJSON(inputs.config_json).simulator }}]
 
 on:
   workflow_dispatch:
