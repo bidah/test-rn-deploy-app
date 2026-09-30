@@ -22,7 +22,9 @@
     "production": {
       "ios": {
         "ascAppId": "6817907751",
-        "groups": []
+        "groups": [
+          "rn-eas QA"
+        ]
       }
     }
   }
