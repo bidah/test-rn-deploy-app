@@ -1,0 +1,323 @@
+# EAS-compatible build workflow.
+#
+# The CLI never rewrites this file — every decision arrives as a dispatch input,
+# so you can also start builds by hand from the Actions tab. `config_json` holds
+# the resolved eas.json profile; GitHub caps workflow_dispatch at ten top-level
+# inputs, which a full build plan comfortably exceeds.
+name: EAS Build
+
+run-name: >-
+  ${{ inputs.platform }} ${{ inputs.profile }} build
+  [eas:dispatch_id=${{ inputs.dispatch_id }};platform=${{ inputs.platform }};profile=${{ inputs.profile }}]
+
+on:
+  workflow_dispatch:
+    inputs:
+      dispatch_id:
+        description: Correlation id stamped into run-name so the CLI can find this run
+        required: true
+      platform:
+        description: ios | android
+        required: true
+      profile:
+        description: Build profile name from eas.json
+        required: true
+        default: production
+      runner:
+        description: Runner label
+        required: true
+        default: macos-15
+      config_json:
+        description: The resolved build plan, as JSON
+        required: true
+
+concurrency:
+  # One build per platform+profile+branch. A newer push makes the older build
+  # pointless, and macOS minutes are the expensive kind.
+  group: eas-build-${{ inputs.platform }}-${{ inputs.profile }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 90
+    env:
+      EAS_PROFILE: ${{ inputs.profile }}
+      EAS_PLATFORM: ${{ inputs.platform }}
+
+    steps:
+      - name: Prepare project
+        id: plan
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Fan the packed plan out into step outputs so later steps read it the
+          # same way they would read a dispatch input.
+          echo '${{ inputs.config_json }}' > /tmp/eas-plan.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          with open('/tmp/eas-plan.json') as fh:
+              plan = json.load(fh)
+          for key, value in plan.items():
+              if key == 'env_json':
+                  continue
+              print(f"{key}={value}")
+          PY
+          echo "Resolved build plan:"
+          python3 -m json.tool /tmp/eas-plan.json
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.plan.outputs.ref || github.ref }}
+          # expo-updates derives a runtime version from the git history in some
+          # configurations, so a shallow clone can change the built artifact.
+          fetch-depth: 0
+
+      - name: Read eas.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f eas.json ]; then
+            echo "::error::eas.json is missing from this commit."
+            exit 1
+          fi
+          echo "Building profile '${{ inputs.profile }}' from eas.json"
+
+      - name: Export build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The profile's `env` map has to be in the environment before the app
+          # config is read: an app.config.js branching on APP_VARIANT resolves at
+          # prebuild time, and missing it silently ships the wrong icon and API host.
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import json
+          with open('/tmp/eas-plan.json') as fh:
+              plan = json.load(fh)
+          for key, value in json.loads(plan.get('env_json') or '{}').items():
+              print(f"{key}={value}")
+          PY
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.plan.outputs.node_version }}
+
+      - name: Set up package manager
+        shell: bash
+        run: |
+          set -euo pipefail
+          PM='${{ steps.plan.outputs.package_manager }}'
+          if [ "${{ steps.plan.outputs.corepack }}" = "true" ]; then
+            corepack enable
+          fi
+          case "$PM" in
+            bun)  curl -fsSL https://bun.sh/install | bash; echo "$HOME/.bun/bin" >> "$GITHUB_PATH" ;;
+            pnpm) npm install -g pnpm ;;
+            yarn) corepack enable || npm install -g yarn ;;
+          esac
+
+      - name: Install JS dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Install with the project's real package manager. Resolving a bun or
+          # pnpm project with npm produces a different tree than the developer
+          # tested against and skips postinstall steps like patch-package.
+          case '${{ steps.plan.outputs.package_manager }}' in
+            bun)  bun install --frozen-lockfile ;;
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn) yarn install --immutable ;;
+            *)    npm ci ;;
+          esac
+
+      - name: Set up JDK
+        if: inputs.platform == 'android'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        if: inputs.platform == 'android'
+        uses: android-actions/setup-android@v3
+
+      - name: Select Xcode
+        if: inputs.platform == 'ios'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Pin one Xcode explicitly. A runner image with several installed can
+          # otherwise dual-load framework copies during simulator work.
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+
+      - name: Prebuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          CMD='${{ steps.plan.outputs.prebuild_command }}'
+          if [ -d ios ] || [ -d android ]; then
+            echo "Native directories are committed — skipping prebuild."
+          elif [ -n "$CMD" ]; then
+            eval "$CMD"
+          else
+            npx expo prebuild --platform '${{ inputs.platform }}' --no-install
+          fi
+
+      - name: Restore pods cache
+        if: inputs.platform == 'ios' && steps.plan.outputs.cache_disabled != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ios/Pods
+          key: pods-${{ steps.plan.outputs.cache_key }}-${{ hashFiles('ios/Podfile.lock') }}
+          restore-keys: pods-${{ steps.plan.outputs.cache_key }}-
+
+      - name: Install pods
+        if: inputs.platform == 'ios'
+        working-directory: ios
+        run: pod install
+
+      - name: Import signing credentials
+        if: inputs.platform == 'ios' && steps.plan.outputs.without_credentials != 'true'
+        shell: bash
+        env:
+          P12: ${{ secrets.EAS_IOS_DIST_P12 }}
+          P12_PASSWORD: ${{ secrets.EAS_IOS_P12_PASSWORD }}
+          PROFILE: ${{ secrets.EAS_IOS_PROFILE }}
+        run: |
+          set -euo pipefail
+          if [ -z "${P12:-}" ]; then
+            echo "::error::No iOS signing credentials in repo secrets. Run 'eas credentials' to check."
+            exit 1
+          fi
+          # A throwaway keychain in RUNNER_TEMP, deleted in the cleanup step —
+          # never the login keychain, which persists between jobs on some runners.
+          KEYCHAIN="$RUNNER_TEMP/eas-build.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+          security import "$RUNNER_TEMP/dist.p12" -P "$P12_PASSWORD" -A \
+            -t cert -f pkcs12 -k "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "$PROFILE" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/eas.mobileprovision
+          rm -f "$RUNNER_TEMP/dist.p12"
+
+      - name: Archive (iOS)
+        if: inputs.platform == 'ios' && steps.plan.outputs.simulator != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SCHEME='${{ steps.plan.outputs.scheme }}'
+          CONFIG='${{ steps.plan.outputs.build_configuration }}'
+          xcodebuild archive \
+            -workspace "ios/$SCHEME.xcworkspace" \
+            -scheme "$SCHEME" \
+            -configuration "$CONFIG" \
+            -destination "generic/platform=iOS" \
+            -archivePath "$RUNNER_TEMP/$SCHEME.xcarchive" \
+            CODE_SIGN_STYLE=Manual \
+            | tee "$RUNNER_TEMP/xcodebuild.log" | xcpretty || true
+          test -d "$RUNNER_TEMP/$SCHEME.xcarchive"
+
+      - name: Export IPA
+        if: inputs.platform == 'ios' && steps.plan.outputs.simulator != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SCHEME='${{ steps.plan.outputs.scheme }}'
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>${{ steps.plan.outputs.export_method }}</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>compileBitcode</key><false/>
+          </dict></plist>
+          PLIST
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/$SCHEME.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export"
+          mkdir -p build && cp "$RUNNER_TEMP"/export/*.ipa build/
+
+      - name: Build for simulator (iOS)
+        if: inputs.platform == 'ios' && steps.plan.outputs.simulator == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SCHEME='${{ steps.plan.outputs.scheme }}'
+          # A simulator build is unsigned and stays a .app — there is no export
+          # step, and the result is what a simulator can install directly.
+          xcodebuild build \
+            -workspace "ios/$SCHEME.xcworkspace" \
+            -scheme "$SCHEME" \
+            -configuration '${{ steps.plan.outputs.build_configuration }}' \
+            -destination "generic/platform=iOS Simulator" \
+            -derivedDataPath "$RUNNER_TEMP/derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            | tee "$RUNNER_TEMP/xcodebuild.log" | xcpretty || true
+          mkdir -p build
+          APP=$(find "$RUNNER_TEMP/derived/Build/Products" -name "*.app" -maxdepth 3 | head -1)
+          # Tar it: a .app is a directory, and upload-artifact would flatten the
+          # bundle's symlinks, leaving something the simulator refuses to install.
+          tar -czf "build/$(basename "$APP" .app)-simulator.tar.gz" -C "$(dirname "$APP")" "$(basename "$APP")"
+
+      - name: Build (Android)
+        if: inputs.platform == 'android'
+        shell: bash
+        env:
+          KEYSTORE: ${{ secrets.EAS_ANDROID_KEYSTORE }}
+          STORE_PASSWORD: ${{ secrets.EAS_ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.EAS_ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.EAS_ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          cd android
+          SIGNING_ARGS=()
+          if [ -n "${KEYSTORE:-}" ]; then
+            echo "$KEYSTORE" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+            # AGP honours these injected properties for any assemble/bundle task,
+            # so the project's own Gradle files are never edited.
+            SIGNING_ARGS=(
+              "-Pandroid.injected.signing.store.file=$RUNNER_TEMP/release.keystore"
+              "-Pandroid.injected.signing.store.password=$STORE_PASSWORD"
+              "-Pandroid.injected.signing.key.alias=$KEY_ALIAS"
+              "-Pandroid.injected.signing.key.password=$KEY_PASSWORD"
+            )
+          fi
+          ./gradlew '${{ steps.plan.outputs.gradle_command }}' "${SIGNING_ARGS[@]}" --no-daemon
+          cd ..
+          mkdir -p build
+          find android/app/build/outputs -name "*.aab" -o -name "*.apk" | xargs -I{} cp {} build/
+
+      - name: Upload application archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: application-archive
+          path: build/*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload Xcode logs
+        if: always() && inputs.platform == 'ios'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcode-logs
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Clean up credentials
+        if: always() && inputs.platform == 'ios'
+        shell: bash
+        run: |
+          security delete-keychain "$RUNNER_TEMP/eas-build.keychain-db" 2>/dev/null || true
+          rm -f ~/Library/MobileDevice/Provisioning\ Profiles/eas.mobileprovision
