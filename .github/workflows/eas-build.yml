@@ -201,6 +201,7 @@ jobs:
           echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
 
       - name: Import signing credentials
+        id: signing
         if: inputs.platform == 'ios' && steps.plan.outputs.without_credentials != 'true'
         shell: bash
         env:
@@ -227,9 +228,74 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
           security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
 
-          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
-          echo "$PROFILE" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/eas.mobileprovision
           rm -f "$RUNNER_TEMP/dist.p12"
+
+          # Xcode matches a profile by UUID, so read it (and the team and bundle
+          # id it was issued for) out of the signed plist rather than trusting a
+          # filename. Xcode 16+ reads UserData; older Xcode reads MobileDevice.
+          echo "$PROFILE" | base64 --decode > "$RUNNER_TEMP/eas.mobileprovision"
+          security cms -D -i "$RUNNER_TEMP/eas.mobileprovision" > "$RUNNER_TEMP/eas-profile.plist"
+          PB() { /usr/libexec/PlistBuddy -c "Print $1" "$RUNNER_TEMP/eas-profile.plist"; }
+          UUID=$(PB UUID)
+          TEAM=$(PB TeamIdentifier:0)
+          APP_ID=$(PB Entitlements:application-identifier)
+          for DIR in ~/Library/MobileDevice/Provisioning\ Profiles ~/Library/Developer/Xcode/UserData/Provisioning\ Profiles; do
+            mkdir -p "$DIR"
+            cp "$RUNNER_TEMP/eas.mobileprovision" "$DIR/$UUID.mobileprovision"
+          done
+
+          # Sign with the identity by SHA-1: unambiguous whether the certificate
+          # is an "iPhone Distribution" or an "Apple Distribution" one.
+          IDENTITY=$(security find-identity -v -p codesigning "$KEYCHAIN" | awk 'NR==1 {print $2}')
+          if [ -z "$IDENTITY" ]; then
+            echo "::error::The .p12 in EAS_IOS_DIST_P12 holds no usable signing identity (is the private key in it?)."
+            exit 1
+          fi
+          {
+            echo "keychain=$KEYCHAIN"
+            echo "identity=$IDENTITY"
+            echo "profile_uuid=$UUID"
+            echo "team_id=$TEAM"
+            echo "bundle_id=${APP_ID#"$TEAM".}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Signing ${APP_ID#"$TEAM".} (team $TEAM) with profile $UUID"
+
+      - name: Apply signing settings
+        if: inputs.platform == 'ios' && steps.plan.outputs.without_credentials != 'true' && steps.plan.outputs.simulator != 'true'
+        shell: bash
+        env:
+          SCHEME: ${{ steps.xcode.outputs.scheme }}
+          TEAM: ${{ steps.signing.outputs.team_id }}
+          IDENTITY: ${{ steps.signing.outputs.identity }}
+          PROFILE_UUID: ${{ steps.signing.outputs.profile_uuid }}
+          BUNDLE_ID: ${{ steps.signing.outputs.bundle_id }}
+        run: |
+          set -euo pipefail
+          # Manual signing goes on the target that ships this bundle id, not on
+          # the command line: a global PROVISIONING_PROFILE_SPECIFIER also lands
+          # on every Pods resource bundle, and xcodebuild rejects those.
+          ruby - <<'RUBY'
+          require 'xcodeproj'
+          project = Xcodeproj::Project.open("ios/#{ENV['SCHEME']}.xcodeproj")
+          matched = 0
+          project.native_targets.each do |target|
+            target.build_configurations.each do |config|
+              bundle = config.build_settings['PRODUCT_BUNDLE_IDENTIFIER'].to_s
+              next unless bundle == ENV['BUNDLE_ID']
+              matched += 1
+              config.build_settings.merge!(
+                'CODE_SIGN_STYLE' => 'Manual',
+                'DEVELOPMENT_TEAM' => ENV['TEAM'],
+                'CODE_SIGN_IDENTITY' => ENV['IDENTITY'],
+                'CODE_SIGN_IDENTITY[sdk=iphoneos*]' => ENV['IDENTITY'],
+                'PROVISIONING_PROFILE_SPECIFIER' => ENV['PROFILE_UUID']
+              )
+            end
+          end
+          abort("::error::No target builds #{ENV['BUNDLE_ID']}, the bundle id the provisioning profile was issued for.") if matched.zero?
+          project.save
+          puts "Manual signing applied to #{matched} build configuration(s) for #{ENV['BUNDLE_ID']}"
+          RUBY
 
       - name: Archive (iOS)
         if: inputs.platform == 'ios' && steps.plan.outputs.simulator != 'true'
@@ -245,7 +311,7 @@ jobs:
             -configuration "$CONFIG" \
             -destination "generic/platform=iOS" \
             -archivePath "$RUNNER_TEMP/$SCHEME.xcarchive" \
-            CODE_SIGN_STYLE=Manual \
+            OTHER_CODE_SIGN_FLAGS="--keychain ${{ steps.signing.outputs.keychain }}" \
             2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" | xcpretty
           # xcpretty only prettifies; xcodebuild's own exit status is the verdict.
           # Swallowing it (`|| true`) turned compile errors into green builds.
@@ -269,6 +335,11 @@ jobs:
           <plist version="1.0"><dict>
             <key>method</key><string>${{ steps.plan.outputs.export_method }}</string>
             <key>signingStyle</key><string>manual</string>
+            <key>teamID</key><string>${{ steps.signing.outputs.team_id }}</string>
+            <key>signingCertificate</key><string>${{ steps.signing.outputs.identity }}</string>
+            <key>provisioningProfiles</key><dict>
+              <key>${{ steps.signing.outputs.bundle_id }}</key><string>${{ steps.signing.outputs.profile_uuid }}</string>
+            </dict>
             <key>compileBitcode</key><false/>
           </dict></plist>
           PLIST
@@ -361,4 +432,8 @@ jobs:
         shell: bash
         run: |
           security delete-keychain "$RUNNER_TEMP/eas-build.keychain-db" 2>/dev/null || true
-          rm -f ~/Library/MobileDevice/Provisioning\ Profiles/eas.mobileprovision
+          UUID='${{ steps.signing.outputs.profile_uuid }}'
+          if [ -n "$UUID" ]; then
+            rm -f ~/Library/MobileDevice/Provisioning\ Profiles/"$UUID".mobileprovision \
+                  ~/Library/Developer/Xcode/UserData/Provisioning\ Profiles/"$UUID".mobileprovision
+          fi
