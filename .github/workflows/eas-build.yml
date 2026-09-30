@@ -26,7 +26,7 @@ on:
       runner:
         description: Runner label
         required: true
-        default: macos-15
+        default: macos-26
       config_json:
         description: The resolved build plan, as JSON
         required: true
@@ -238,6 +238,7 @@ jobs:
           set -euo pipefail
           SCHEME='${{ steps.xcode.outputs.scheme }}'
           CONFIG='${{ steps.plan.outputs.build_configuration }}'
+          set +e
           xcodebuild archive \
             -workspace "ios/$SCHEME.xcworkspace" \
             -scheme "$SCHEME" \
@@ -245,7 +246,15 @@ jobs:
             -destination "generic/platform=iOS" \
             -archivePath "$RUNNER_TEMP/$SCHEME.xcarchive" \
             CODE_SIGN_STYLE=Manual \
-            | tee "$RUNNER_TEMP/xcodebuild.log" | xcpretty || true
+            2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" | xcpretty
+          # xcpretty only prettifies; xcodebuild's own exit status is the verdict.
+          # Swallowing it (`|| true`) turned compile errors into green builds.
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$STATUS" != "0" ]; then
+            echo "::error::xcodebuild archive failed (exit $STATUS). The full log is in the xcode-logs artifact."
+            exit "$STATUS"
+          fi
           test -d "$RUNNER_TEMP/$SCHEME.xcarchive"
 
       - name: Export IPA
@@ -277,6 +286,7 @@ jobs:
           SCHEME='${{ steps.xcode.outputs.scheme }}'
           # A simulator build is unsigned and stays a .app — there is no export
           # step, and the result is what a simulator can install directly.
+          set +e
           xcodebuild build \
             -workspace "ios/$SCHEME.xcworkspace" \
             -scheme "$SCHEME" \
@@ -284,9 +294,19 @@ jobs:
             -destination "generic/platform=iOS Simulator" \
             -derivedDataPath "$RUNNER_TEMP/derived" \
             CODE_SIGNING_ALLOWED=NO \
-            | tee "$RUNNER_TEMP/xcodebuild.log" | xcpretty || true
+            2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" | xcpretty
+          STATUS=${PIPESTATUS[0]}
+          set -e
+          if [ "$STATUS" != "0" ]; then
+            echo "::error::xcodebuild build failed (exit $STATUS). The full log is in the xcode-logs artifact."
+            exit "$STATUS"
+          fi
           mkdir -p build
-          APP=$(find "$RUNNER_TEMP/derived/Build/Products" -name "*.app" -maxdepth 3 | head -1)
+          APP=$(find "$RUNNER_TEMP/derived/Build/Products" -maxdepth 3 -name "*.app" | head -1)
+          if [ -z "$APP" ] || [ ! -f "$APP/Info.plist" ]; then
+            echo "::error::xcodebuild reported success but produced no usable .app bundle."
+            exit 1
+          fi
           # Tar it: a .app is a directory, and upload-artifact would flatten the
           # bundle's symlinks, leaving something the simulator refuses to install.
           tar -czf "build/$(basename "$APP" .app)-simulator.tar.gz" -C "$(dirname "$APP")" "$(basename "$APP")"
