@@ -179,6 +179,27 @@ jobs:
         working-directory: ios
         run: pod install
 
+      - name: Resolve Xcode scheme
+        id: xcode
+        if: inputs.platform == 'ios'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A profile's `scheme` wins. Otherwise use the workspace prebuild just
+          # generated, as EAS does — it is named after the app, which the CLI
+          # cannot know for a managed project before prebuild has run.
+          SCHEME='${{ steps.plan.outputs.scheme }}'
+          if [ -z "$SCHEME" ]; then
+            WORKSPACES=$(find ios -maxdepth 1 -name '*.xcworkspace')
+            if [ "$(echo "$WORKSPACES" | grep -c .)" != "1" ]; then
+              echo "::error::Expected exactly one .xcworkspace in ios/, found: ${WORKSPACES:-none}. Set \"scheme\" on the build profile in eas.json."
+              exit 1
+            fi
+            SCHEME=$(basename "$WORKSPACES" .xcworkspace)
+          fi
+          echo "Using Xcode scheme: $SCHEME"
+          echo "scheme=$SCHEME" >> "$GITHUB_OUTPUT"
+
       - name: Import signing credentials
         if: inputs.platform == 'ios' && steps.plan.outputs.without_credentials != 'true'
         shell: bash
@@ -215,7 +236,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          SCHEME='${{ steps.plan.outputs.scheme }}'
+          SCHEME='${{ steps.xcode.outputs.scheme }}'
           CONFIG='${{ steps.plan.outputs.build_configuration }}'
           xcodebuild archive \
             -workspace "ios/$SCHEME.xcworkspace" \
@@ -232,7 +253,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          SCHEME='${{ steps.plan.outputs.scheme }}'
+          SCHEME='${{ steps.xcode.outputs.scheme }}'
           cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -253,7 +274,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          SCHEME='${{ steps.plan.outputs.scheme }}'
+          SCHEME='${{ steps.xcode.outputs.scheme }}'
           # A simulator build is unsigned and stays a .app — there is no export
           # step, and the result is what a simulator can install directly.
           xcodebuild build \
@@ -321,4 +342,3 @@ jobs:
         run: |
           security delete-keychain "$RUNNER_TEMP/eas-build.keychain-db" 2>/dev/null || true
           rm -f ~/Library/MobileDevice/Provisioning\ Profiles/eas.mobileprovision
-
