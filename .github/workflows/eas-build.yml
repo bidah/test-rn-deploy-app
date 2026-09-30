@@ -141,7 +141,7 @@ jobs:
 
       - name: Set up Android SDK
         if: inputs.platform == 'android'
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Select Xcode
         if: inputs.platform == 'ios'
