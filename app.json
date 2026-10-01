@@ -2,7 +2,7 @@
   "expo": {
     "name": "test-rn-deploy-app",
     "slug": "test-rn-deploy-app",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -16,7 +16,8 @@
       "bundleIdentifier": "com.bidah.testrndeployapp",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false
-      }
+      },
+      "buildNumber": "2"
     },
     "android": {
       "adaptiveIcon": {
@@ -25,7 +26,8 @@
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "package": "com.bidah.testrndeployapp"
+      "package": "com.bidah.testrndeployapp",
+      "versionCode": 2
     },
     "web": {
       "favicon": "./assets/favicon.png"
