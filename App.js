@@ -5,9 +5,9 @@ export default function App() {
   return (
     <View style={styles.container}>
       <Text style={styles.badge}>UPDATE TEST</Text>
-      <Text style={styles.title}>Update v2 ✅</Text>
+      <Text style={styles.title}>Update v3</Text>
       <Text style={styles.subtitle}>
-        If you can read this, the reinstall from the QR code replaced the first build.
+        Edited on the Mac at 05:13:44 — no rebuild, no reinstall.
       </Text>
       <Text style={styles.version}>1.0.1 (2) · preview</Text>
       <StatusBar style="light" />
@@ -18,7 +18,7 @@ export default function App() {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-    backgroundColor: '#312e81',
+    backgroundColor: '#065f46',
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 32,
