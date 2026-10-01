@@ -16,6 +16,10 @@
     },
     "production": {
       "autoIncrement": true
+    },
+    "development-device": {
+      "developmentClient": true,
+      "distribution": "internal"
     }
   },
   "submit": {
