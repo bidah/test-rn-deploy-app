@@ -207,12 +207,24 @@ jobs:
         env:
           P12: ${{ secrets.EAS_IOS_DIST_P12 }}
           P12_PASSWORD: ${{ secrets.EAS_IOS_P12_PASSWORD }}
-          PROFILE: ${{ secrets.EAS_IOS_PROFILE }}
+          PROFILE_STORE: ${{ secrets.EAS_IOS_PROFILE }}
+          PROFILE_INTERNAL: ${{ secrets.EAS_IOS_PROFILE_INTERNAL }}
         run: |
           set -euo pipefail
           if [ -z "${P12:-}" ]; then
             echo "::error::No iOS signing credentials in repo secrets. Run 'eas credentials' to check."
             exit 1
+          fi
+          # An App Store profile cannot sign an ad-hoc export and vice versa, so
+          # internal builds have their own profile — the one listing test devices.
+          if [ '${{ steps.plan.outputs.export_method }}' = 'ad-hoc' ]; then
+            PROFILE="${PROFILE_INTERNAL:-}"
+            if [ -z "$PROFILE" ]; then
+              echo "::error::Internal iOS builds need an ad-hoc provisioning profile with your test devices in the EAS_IOS_PROFILE_INTERNAL secret. Run 'eas credentials' to check."
+              exit 1
+            fi
+          else
+            PROFILE="${PROFILE_STORE:-}"
           fi
           # A throwaway keychain in RUNNER_TEMP, deleted in the cleanup step —
           # never the login keychain, which persists between jobs on some runners.
@@ -409,6 +421,97 @@ jobs:
           cd ..
           mkdir -p build
           find android/app/build/outputs -name "*.aab" -o -name "*.apk" | xargs -I{} cp {} build/
+
+      - name: Publish for install
+        # Internal builds go to the install service so a QR code can put them on
+        # a phone: GitHub artifacts are zips behind a login, which iOS and Android
+        # cannot install. Opt-in via the EAS_INSTALL_URL variable.
+        if: steps.plan.outputs.distribution == 'internal' && steps.plan.outputs.simulator != 'true' && vars.EAS_INSTALL_URL != ''
+        shell: bash
+        env:
+          INSTALL_URL: ${{ vars.EAS_INSTALL_URL }}
+          INSTALL_TOKEN: ${{ secrets.EAS_INSTALL_TOKEN }}
+          DISPATCH_ID: ${{ inputs.dispatch_id }}
+          APP_NAME: ${{ steps.plan.outputs.app_name }}
+          APP_VERSION: ${{ steps.plan.outputs.app_version }}
+          ANDROID_PACKAGE: ${{ steps.plan.outputs.android_package }}
+        run: |
+          set -euo pipefail
+          if [ -z "${INSTALL_TOKEN:-}" ]; then
+            echo "::warning::EAS_INSTALL_URL is set but the EAS_INSTALL_TOKEN secret is not; skipping install publishing."
+            exit 0
+          fi
+          INSTALL_URL="${INSTALL_URL%/}"
+          if [ "$EAS_PLATFORM" = "ios" ]; then
+            FILE=$(find build -maxdepth 1 -name '*.ipa' | head -1)
+            NAME=app.ipa
+            # The IPA is the source of truth for what iOS will check at install.
+            unzip -p "$FILE" 'Payload/*.app/Info.plist' > "$RUNNER_TEMP/Info.plist"
+            INFO() { plutil -extract "$1" raw -o - "$RUNNER_TEMP/Info.plist" 2>/dev/null || true; }
+            BUNDLE_ID=$(INFO CFBundleIdentifier)
+            VERSION=$(INFO CFBundleShortVersionString)
+            BUILD_NUMBER=$(INFO CFBundleVersion)
+            DISPLAY_NAME=$(INFO CFBundleDisplayName)
+          else
+            FILE=$(find build -maxdepth 1 -name '*.apk' | head -1)
+            NAME=app.apk
+            BUNDLE_ID="$ANDROID_PACKAGE"
+            VERSION="$APP_VERSION"
+            BUILD_NUMBER=""
+            DISPLAY_NAME=""
+          fi
+          if [ -z "$FILE" ]; then
+            echo "::error::No installable $NAME was produced, so there is nothing to publish."
+            exit 1
+          fi
+
+          API="$INSTALL_URL/api/uploads/builds/$DISPATCH_ID"
+          AUTH=(-H "Authorization: Bearer $INSTALL_TOKEN")
+          # R2 multipart in 50 MiB parts: comfortably under the Workers request
+          # body limit, and above R2's 5 MiB minimum for every part but the last.
+          UPLOAD_ID=$(curl -fsS -X POST "${AUTH[@]}" "$API/$NAME?mpu=create" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["uploadId"])')
+          split -b 50m "$FILE" "$RUNNER_TEMP/install-part-"
+          N=0
+          : > "$RUNNER_TEMP/install-parts.jsonl"
+          for PART in "$RUNNER_TEMP"/install-part-*; do
+            N=$((N + 1))
+            curl -fsS -X PUT "${AUTH[@]}" --data-binary @"$PART" \
+              "$API/$NAME?mpu=part&uploadId=$UPLOAD_ID&partNumber=$N" >> "$RUNNER_TEMP/install-parts.jsonl"
+            echo >> "$RUNNER_TEMP/install-parts.jsonl"
+          done
+          python3 -c 'import json,sys; print(json.dumps({"parts": [json.loads(l) for l in open(sys.argv[1]) if l.strip()]}))' \
+            "$RUNNER_TEMP/install-parts.jsonl" > "$RUNNER_TEMP/install-complete.json"
+          curl -fsS -X POST "${AUTH[@]}" -H 'content-type: application/json' \
+            --data-binary @"$RUNNER_TEMP/install-complete.json" "$API/$NAME?mpu=complete&uploadId=$UPLOAD_ID" >/dev/null
+
+          # meta.json goes last: the install page only appears once the binary
+          # it points at is complete.
+          SIZE=$(wc -c < "$FILE" | tr -d ' ')
+          export BUNDLE_ID VERSION BUILD_NUMBER SIZE
+          export NAME_SHOWN="${DISPLAY_NAME:-$APP_NAME}"
+          python3 - > "$RUNNER_TEMP/install-meta.json" <<'PY'
+          import json, os
+          from datetime import datetime, timezone
+          print(json.dumps({
+              "platform": os.environ["EAS_PLATFORM"],
+              "name": os.environ["NAME_SHOWN"],
+              "bundleId": os.environ["BUNDLE_ID"],
+              "version": os.environ["VERSION"],
+              "buildNumber": os.environ["BUILD_NUMBER"] or None,
+              "profile": os.environ["EAS_PROFILE"],
+              "commit": os.environ["GITHUB_SHA"],
+              "repo": os.environ["GITHUB_REPOSITORY"],
+              "runId": int(os.environ["GITHUB_RUN_ID"]),
+              "createdAt": datetime.now(timezone.utc).isoformat(),
+              "size": int(os.environ["SIZE"]),
+          }))
+          PY
+          curl -fsS -X PUT "${AUTH[@]}" --data-binary @"$RUNNER_TEMP/install-meta.json" "$API/meta.json" >/dev/null
+
+          PAGE="$INSTALL_URL/install/$DISPATCH_ID"
+          echo "Install page: $PAGE"
+          echo "### 📲 [Install this build]($PAGE)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload application archive
         uses: actions/upload-artifact@v4
